@@ -29,8 +29,9 @@ import (
 const (
 	ContentEventStream = "text/event-stream"
 
-	sseIDPrefix   = "id: "
-	sseDataPrefix = "data: "
+	sseIDPrefix               = "id: "
+	sseDataPrefix             = "data: "
+	sseDataPrefixWithoutSpace = "data:"
 
 	// MaxSSETokenSize is the maximum size for SSE data lines (10MB).
 	// The default bufio.Scanner buffer of 64KB is insufficient for large payloads
@@ -85,14 +86,25 @@ func ParseDataStream(body io.Reader) iter.Seq2[[]byte, error] {
 		buf := make([]byte, 0, bufio.MaxScanTokenSize)
 		scanner.Buffer(buf, MaxSSETokenSize)
 		prefixBytes := []byte(sseDataPrefix)
+		prefixWithoutSpaceBytes := []byte(sseDataPrefixWithoutSpace)
 
 		for scanner.Scan() {
 			lineBytes := scanner.Bytes()
+
+			var data []byte
 			if bytes.HasPrefix(lineBytes, prefixBytes) {
-				data := lineBytes[len(prefixBytes):]
-				if !yield(data, nil) {
-					return
-				}
+				// Standard format: "data: ..."
+				data = lineBytes[len(prefixBytes):]
+			} else if bytes.HasPrefix(lineBytes, prefixWithoutSpaceBytes) {
+				// Non-compliant format: "data:..."
+				data = lineBytes[len(prefixWithoutSpaceBytes):]
+			} else {
+				// Not a data line (comment, event, id, retry, etc.)
+				continue
+			}
+
+			if !yield(data, nil) {
+				return
 			}
 			// Ignore empty lines, comments, and other SSE event types
 		}
