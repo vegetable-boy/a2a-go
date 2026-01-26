@@ -31,6 +31,7 @@ import (
 	"github.com/a2aproject/a2a-go/internal/testutil"
 	"github.com/a2aproject/a2a-go/internal/utils"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 var fixedTime = time.Now()
@@ -710,25 +711,61 @@ func TestRequestHandler_TaskExecutionFailOnPush(t *testing.T) {
 }
 
 func TestRequestHandler_TaskExecutionFailOnInvalidEvent(t *testing.T) {
-	ctx := t.Context()
-
-	taskSeed := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID()}
-	input := &a2a.MessageSendParams{Message: newUserMessage(taskSeed, "work")}
-
-	store := testutil.NewTestTaskStore().WithTasks(t, taskSeed)
-	executor := newEventReplayAgent([]a2a.Event{&a2a.Task{ID: "wrong id", ContextID: a2a.NewContextID()}}, nil)
-	handler := NewHandler(executor, WithTaskStore(store))
-
-	result, err := handler.OnSendMessage(ctx, input)
-	if err != nil {
-		t.Fatalf("OnSendMessage() error = %v", err)
+	testCases := []struct {
+		name  string
+		event *a2a.Task
+	}{
+		{
+			name:  "non-final event",
+			event: &a2a.Task{ID: "wrong id", ContextID: a2a.NewContextID()},
+		},
+		{
+			name:  "final event",
+			event: &a2a.Task{ID: "wrong id", ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}},
+		},
 	}
-	task, ok := result.(*a2a.Task)
-	if !ok {
-		t.Fatalf("OnSendMessage() result type = %T, want *a2a.Task", result)
-	}
-	if task.Status.State != a2a.TaskStateFailed {
-		t.Fatalf("OnSendMessage() result = %+v, want state %q", result, a2a.TaskStateFailed)
+
+	for _, tc := range testCases {
+		for _, streaming := range []bool{false, true} {
+			name := tc.name
+			if streaming {
+				name = name + " (streaming)"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctx := t.Context()
+				taskSeed := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID()}
+				input := &a2a.MessageSendParams{Message: newUserMessage(taskSeed, "work")}
+
+				store := testutil.NewTestTaskStore().WithTasks(t, taskSeed)
+				executor := newEventReplayAgent([]a2a.Event{tc.event}, nil)
+				handler := NewHandler(executor, WithTaskStore(store))
+
+				var result a2a.Event
+				if streaming {
+					for event, err := range handler.OnSendMessageStream(ctx, input) {
+						if err != nil {
+							t.Fatalf("OnSendMessageStream() error = %v", err)
+						}
+						result = event
+					}
+				} else {
+					localResult, err := handler.OnSendMessage(ctx, input)
+					if err != nil {
+						t.Fatalf("OnSendMessage() error = %v", err)
+					}
+					result = localResult
+				}
+
+				task, ok := result.(*a2a.Task)
+				if !ok {
+					t.Fatalf("OnSendMessage() result type = %T, want *a2a.Task", result)
+				}
+				if task.Status.State != a2a.TaskStateFailed {
+					t.Fatalf("OnSendMessage() result = %+v, want state %q", result, a2a.TaskStateFailed)
+				}
+			})
+		}
 	}
 }
 
@@ -1325,6 +1362,92 @@ func TestRequestHandler_RequestContextInterceptorRejectsRequest(t *testing.T) {
 	}
 	if executor.executeCalled {
 		t.Fatal("want agent executor to no be called")
+	}
+}
+
+func TestRequestHandler_ExecuteRequestContextLoading(t *testing.T) {
+	ctxID := a2a.NewMessageID()
+	taskSeed := &a2a.Task{
+		ID:        a2a.NewTaskID(),
+		ContextID: a2a.NewContextID(),
+		Status:    a2a.TaskStatus{State: a2a.TaskStateInputRequired},
+	}
+	testCases := []struct {
+		name           string
+		newRequest     func() *a2a.MessageSendParams
+		wantReqCtxMeta map[string]any
+		wantStoredTask *a2a.Task
+		wantContextID  string
+	}{
+		{
+			name: "new task",
+			newRequest: func() *a2a.MessageSendParams {
+				msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "Hello"})
+				msg.Metadata = map[string]any{"foo1": "bar1"}
+				return &a2a.MessageSendParams{
+					Message:  msg,
+					Metadata: map[string]any{"foo2": "bar2"},
+				}
+			},
+			wantReqCtxMeta: map[string]any{"foo2": "bar2"},
+		},
+		{
+			name: "stored tasks",
+			newRequest: func() *a2a.MessageSendParams {
+				msg := a2a.NewMessageForTask(a2a.MessageRoleUser, taskSeed, a2a.TextPart{Text: "Hello"})
+				msg.Metadata = map[string]any{"foo1": "bar1"}
+				return &a2a.MessageSendParams{
+					Message:  msg,
+					Metadata: map[string]any{"foo2": "bar2"},
+				}
+			},
+			wantStoredTask: taskSeed,
+			wantContextID:  taskSeed.ContextID,
+			wantReqCtxMeta: map[string]any{"foo2": "bar2"},
+		},
+		{
+			name: "preserve message context",
+			newRequest: func() *a2a.MessageSendParams {
+				msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "Hello"})
+				msg.ContextID = ctxID
+				return &a2a.MessageSendParams{Message: msg}
+			},
+			wantContextID: ctxID,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			executor := newEventReplayAgent([]a2a.Event{a2a.NewMessage(a2a.MessageRoleAgent, a2a.TextPart{Text: "Done!"})}, nil)
+			var gotReqCtx *RequestContext
+			handler := NewHandler(
+				executor,
+				WithTaskStore(testutil.NewTestTaskStore().WithTasks(t, taskSeed)),
+				WithRequestContextInterceptor(interceptReqCtxFn(func(ctx context.Context, reqCtx *RequestContext) (context.Context, error) {
+					gotReqCtx = reqCtx
+					return ctx, nil
+				})),
+			)
+			request := tc.newRequest()
+			_, err := handler.OnSendMessage(ctx, request)
+			if err != nil {
+				t.Fatalf("handler.OnSendMessage() error = %v, want nil", err)
+			}
+			opts := []cmp.Option{cmpopts.IgnoreFields(a2a.Task{}, "History")}
+			if diff := cmp.Diff(tc.wantStoredTask, gotReqCtx.StoredTask, opts...); diff != "" {
+				t.Fatalf("wrong request context stored task (+got,-want): diff = %s", diff)
+			}
+			if diff := cmp.Diff(tc.wantReqCtxMeta, gotReqCtx.Metadata); diff != "" {
+				t.Fatalf("wrong request context meta (+got,-want): diff = %s", diff)
+			}
+			if tc.wantContextID != "" {
+				if tc.wantContextID != gotReqCtx.ContextID {
+					t.Fatalf("reqCtx.contextID = %s, want = %s", gotReqCtx.ContextID, tc.wantContextID)
+				}
+			}
+		})
 	}
 }
 
